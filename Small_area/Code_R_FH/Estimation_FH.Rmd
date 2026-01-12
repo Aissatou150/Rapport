@@ -1,0 +1,2497 @@
+---
+title: "ESTIMATION"
+author: "Aïssatou GUEYE"
+date: "`r Sys.Date()`"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# PRÉAMBULE
+
+## Nettoyage de l'environnement
+```{r}
+# Supprimer tous les objets existants
+rm(list = ls())
+```
+
+## Chargement des packages
+```{r message=FALSE, warning=FALSE, include=FALSE}
+# Packages SAE
+library(emdi)      # Estimation sur petits domaines
+library(sae)       # Méthodes SAE alternatives
+
+# Packages manipulation données
+library(readxl)    # Import Excel
+library(dplyr)     # Manipulation données
+library(tidyverse) # Ecosystème tidyverse
+
+# Packages statistiques
+library(moments)   # Skewness/kurtosis
+library(lmtest)    # Tests diagnostics (Breusch-Pagan)
+library(car)       # VIF
+library(Hmisc)     # Corrélations avec p-values
+library(nortest)
+library(tseries)
+
+# Packages visualisation
+library(ggplot2)   # Graphiques
+library(corrplot)  # Matrices de corrélation
+
+# Packages export
+library(writexl)   # Export Excel
+```
+
+## Définition du répertoire de travail
+```{r}
+setwd("C:/Users/LENOVO/Desktop/ECOLE/ENSAE/MEMOIRE/Rapport_de_stage/Small_area/Code_R_FH")
+```
+
+---
+
+# IMPORTATION & EXPLORATION DES DONNÉES
+
+**Objectif** : Charger les données et comprendre leur structure avant toute modélisation.
+
+## Importation des données
+```{r}
+# Importer depuis Excel
+data <- read_excel("data/var_auxil.xlsx", sheet = "var_aux")
+
+# Convertir en data.frame standard (compatibilité packages SAE)
+data <- as.data.frame(data)
+```
+
+## Structure des données
+```{r}
+# Dimensions
+cat("Dimensions : ", nrow(data), "départements ×", ncol(data), "variables\n")
+
+# Structure
+str(data)
+
+# Aperçu
+head(data)
+```
+
+## Renommage des variables
+
+```{r}
+colnames(data)
+```
+
+```{r}
+# Simplifier les noms pour faciliter le code
+data <- data %>% 
+  rename(
+    H_dept = "taux_pauvrete_MD",
+    dist_hopital = "distance_hopital (km)",
+    dist_ecole = "distance_école (km)",
+    densite_pop = "pop_density_2020 (hbts/km2)",
+    night_light = "light_mean_2023 (nW/cm²/sr) (Lumière par surface ET par direction)",
+    dist_roads = "distance_roads_mean (km)",
+    rend_mil = "Rendmnt_mil_Kg/ha",
+    rend_riz = "Rendmnt_riz_Kg/ha",
+    rend_sorgho = "Rendmnt_sorgho_Kg/ha",
+    rend_mais = "Rendmnt_mais_Kg/ha"
+  )
+
+cat("Variables disponibles :\n")
+print(colnames(data))
+```
+
+---
+
+# ESTIMATIONS DIRECTES & DIAGNOSTICS
+
+**Objectif** : Identifier les **problèmes des estimations directes** qui justifient l'utilisation du SAE.
+
+## Distribution de l'incidence de pauvreté
+```{r}
+# Statistiques descriptives
+cat("=== STATISTIQUES H_dept ===\n")
+summary(data$H_dept)
+
+# Graphique distribution
+ggplot(data, aes(x = H_dept)) +
+  geom_histogram(bins = 15, fill = "steelblue", color = "white", alpha = 0.8) +
+  geom_vline(aes(xintercept = mean(H_dept)), 
+             color = "red", linetype = "dashed", linewidth = 1) +
+  labs(
+    title = "Distribution de l'incidence de pauvreté multidimensionnelle",
+    x = "Incidence de pauvreté (H_dept)",
+    y = "Fréquence"
+  ) +
+  theme_minimal()
+```
+
+## Test de normalité de H_dept
+```{r}
+# Test de Shapiro-Wilk AVANT transformation
+sw_h <- shapiro.test(data$H_dept)
+
+cat("Test de normalité de H_dept :\n")
+cat("Statistique W =", round(sw_h$statistic, 4), "\n")
+cat("P-value =", round(sw_h$p.value, 4), "\n")
+cat("Conclusion :", ifelse(sw_h$p.value > 0.05, 
+                            "  Distribution normale (p > 0.05)", 
+                            "✗ Distribution non-normale -> Transformation nécessaire"), "\n")
+```
+
+## Vérification des valeurs extrêmes
+```{r}
+# Valeurs extrêmes problématiques pour transformations logit/log
+cat("=== VÉRIFICATION VALEURS EXTRÊMES ===\n")
+cat("Min H_dept     :", min(data$H_dept), "\n")
+cat("Max H_dept     :", max(data$H_dept), "\n")
+cat("Nb H = 0       :", sum(data$H_dept == 0), "\n")
+cat("Nb H = 1       :", sum(data$H_dept == 1), "\n")
+cat("Nb H < 0.01    :", sum(data$H_dept < 0.01), "\n")
+cat("Nb H > 0.99    :", sum(data$H_dept > 0.99), "\n")
+
+```
+
+## Coefficients de variation des estimations directes
+```{r}
+# Statistiques CV
+cat("=== COEFFICIENTS DE VARIATION (CV) DIRECTS ===\n")
+summary(data$cv_H)
+
+# Départements problématiques (CV > 15%)
+seuil_cv <- 0.2
+n_prob <- sum(data$cv_H > seuil_cv, na.rm = TRUE)
+
+cat("\n✗ Départements avec CV >", seuil_cv*100, "% :", n_prob, "/", nrow(data), "\n")
+cat("-> Ces départements ont des estimations directes PEU FIABLES\n")
+cat("-> Justification du recours au SAE\n\n")
+
+# Tableau départements problématiques
+data %>% 
+  filter(cv_H > seuil_cv) %>% 
+  select(departement, H_dept, cv_H, n_echantillon) %>%
+  arrange(desc(cv_H)) %>%
+  print()
+```
+
+
+```{r}
+# Afficher les CV directs
+cat("=== COEFFICIENTS DE VARIATION DIRECTS PAR DÉPARTEMENT ===\n")
+print(data %>% 
+        select(departement, H_dept, cv_H, n_echantillon) %>%
+        arrange(desc(cv_H)))
+```
+
+```{r}
+# 1. Statistiques descriptives CV
+summary(data$cv_H)
+sd(data$cv_H)
+
+# 2. Classification par qualité
+data$qualite_cv <- cut(data$cv_H, 
+                     breaks = c(0, 0.10, 0.15, 0.20, Inf),
+                     labels = c("Excellent", "Bon", "Acceptable", "Problématique"))
+
+table(data$qualite_cv)
+prop.table(table(data$qualite_cv)) * 100
+
+# 3. Graphiques
+# Histogramme CV
+hist(data$cv_H, breaks=20, main="Distribution des CV", xlab="CV", col="steelblue")
+abline(v=c(0.10, 0.15, 0.20), col=c("green","orange","red"), lty=2, lwd=2)
+
+# Boxplot
+boxplot(data$cv_H, horizontal=TRUE, main="Distribution des CV")
+```
+
+```{r}
+# 1. Corrélation n_echantillon vs CV
+cor.test(data$n_echantillon, data$cv_H, method="pearson")
+cor.test(data$n_echantillon, data$cv_H, method="spearman")
+
+# 2. Graphique scatter
+plot(data$n_echantillon, data$cv_H, 
+     xlab="Taille d'échantillon", ylab="CV (%)",
+     main="Relation taille échantillon - précision",
+     pch=19, col="steelblue")
+abline(h=c(0.10, 0.15, 0.20), col=c("green","orange","red"), lty=2)
+
+# Ajouter courbe lissée
+lines(lowess(data$n_echantillon, data$cv_H), col="red", lwd=2)
+
+# 3. Identifier départements problématiques
+prob_dept <- data[data$cv_H > 0.20, c("departement", "n_echantillon", "cv_H")]
+```
+
+
+
+```{r}
+# Visualiser la précision par département
+data_cv_plot <- data %>%
+  arrange(cv_H) %>%
+  mutate(dept_ordered = factor(departement, levels = departement))
+
+ggplot(data_cv_plot, aes(x = dept_ordered, y = cv_H)) +
+  geom_col(aes(fill = cv_H > seuil_cv)) +
+  geom_hline(yintercept = seuil_cv, color = "red", linetype = "dashed", linewidth = 1) +
+  scale_fill_manual(
+    values = c("TRUE" = "#D32F2F", "FALSE" = "#388"),
+    labels = c("CV acceptable", "CV > 20% (problématique)")
+  ) +
+  labs(
+    title = "Coefficient de variation des estimations directes par département",
+    subtitle = paste(n_prob, "départements avec CV > 20%"),
+    x = "Départements (ordonnés par CV)",
+    y = "Coefficient de variation (%)",
+    fill = "Qualité"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 7),
+    legend.position = "top"
+  )
+```
+# LISSAGE DES VARIANCES (GVF)
+
+**Objectif CRITIQUE** : Stabiliser les variances d'échantillonnage avant la modélisation FH.  
+**Référence** : Wolter (2007) - Standard méthodologique en SAE.
+
+**Pourquoi AVANT la sélection des variables ?**  
+-> Les variances lissées seront utilisées dans le modèle Fay-Herriot  
+-> Évite l'instabilité due aux petits échantillons
+
+
+## Modèle de lissage GVF
+
+```{r}
+summary(data$variance_directe)
+
+sum(is.na(data$variance_directe))
+sum(data$variance_directe <= 0, na.rm = TRUE)
+
+```
+
+
+```{r}
+
+gvf_model <- lm(
+  log(variance_directe) ~ alpha_pct + taux_emploi_pct + ratio_dep + 
+                          handicap_pct + eau_pct + toilette_pct + logt_pct +
+                          elec_pct + equip_dep + insa_alim_pct + dist_hopital +
+                          dist_ecole + densite_pop + night_light + dist_roads +
+                          rend_mil + rend_mais + rend_sorgho + rend_riz,
+  data = data)
+
+# stepwise
+stepwise<- step(gvf_model, direction = "both", trace = 1)
+summary(stepwise)
+
+# Prédiction 
+data$logvardirect = predict(stepwise)
+
+# Transformation exponentielle pour obtenir la variance
+data$vardirect <- exp(data$logvardirect)
+
+# Calcul du MSE
+mse_modere1 <- mean((data$vardirect - data$variance_directe)^2, na.rm = TRUE)
+
+# Affichage du résultat
+print(paste("Le MSE est :", mse_modere1))
+
+
+```
+
+# test de validation 
+```{r}
+# test de normalite
+shapiro.test(residuals(stepwise))
+
+# test d'heterodiscite
+bptest(stepwise)
+```
+
+
+## Graphique comparatif : variance directe vs lissée
+```{r}
+
+# 1. Préparation des données
+data_sorted <- data %>% 
+  arrange(n_echantillon) %>%
+  # Transformation en facteur pour figer l'ordre selon n_echantillon
+  mutate(departement = factor(departement, levels = unique(departement)))
+
+# 2. Graphique
+ggplot(data_sorted, aes(x = departement, group = 1)) + # Ajout de group = 1 pour relier les points
+  geom_line(aes(y = variance_directe, color = "Directe"), linewidth = 1.2) +
+  geom_line(aes(y = vardirect, color = "Lissée (GVF)"), linewidth = 1.2) +
+  scale_color_manual(
+    values = c("Directe" = "#D32F2F", "Lissée (GVF)" = "#1976D2")
+  ) +
+  labs(
+    title = "Variance des erreurs d'échantillonnage : directe vs lissée",
+    subtitle = "Le lissage GVF stabilise les estimations entre départements",
+    x = "Départements (ordonnés par taille d'échantillon)",
+    y = "Variance",
+    color = "Type"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    # Rotation des noms pour éviter le chevauchement
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 8) 
+  )
+```
+
+
+```{r}
+summary(data$variance_directe)
+summary(data$vardirect)
+```
+
+**Observation** : Le modèle GVF **réduit l'amplitude** des variances et crée plus de **stabilité**.
+
+## Utilisation des variances lissées pour la suite
+```{r}
+# Remplacer variance_directe par variance_lissee
+data$var_H <- data$vardirect
+
+cat("  Les variances lissées seront utilisées dans le modèle Fay-Herriot\n")
+```
+# SÉLECTION DES VARIABLES AUXILIAIRES
+
+**Objectif** : Identifier les covariables (RGPH-5) qui prédisent bien la pauvreté.  
+**Méthode** : Corrélation (|r| ≥ 0.30) + Élimination multicolinéarité (VIF < 10)
+
+## Analyse des rendements agricoles
+
+### Corrélations avec H_dept
+```{r}
+cultures <- c("mil", "mais", "sorgho", "riz")
+
+cat("=== CORRÉLATIONS : H_dept et RENDEMENTS AGRICOLES ===\n\n")
+
+resultats_agri <- data.frame()
+
+for (culture in cultures) {
+  var_name <- paste0("rend_", culture)
+  
+  test_corr <- cor.test(data$H_dept, data[[var_name]], method = "pearson")
+  
+  decision <- ifelse(
+    abs(test_corr$estimate) >= 0.30 & test_corr$p.value < 0.05, 
+    "  RETENIR", 
+    "✗ Écarter"
+  )
+  
+  resultats_agri <- rbind(resultats_agri, data.frame(
+    Culture = culture,
+    Correlation = round(test_corr$estimate, 4),
+    P_value = round(test_corr$p.value, 4),
+    Decision = decision
+  ))
+  
+  cat("Rendement", culture, ":\n")
+  cat("  r =", round(test_corr$estimate, 4), 
+      ", p =", round(test_corr$p.value, 4), 
+      "->", decision, "\n\n")
+}
+
+print(resultats_agri, row.names = FALSE)
+```
+
+### Graphiques de corrélation
+```{r fig.width=10, fig.height=8}
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+
+for (culture in cultures) {
+  var_name <- paste0("rend_", culture)
+  
+  plot(
+    data[[var_name]], data$H_dept,
+    main = paste("Rendement", culture, "vs H_dept"),
+    xlab = paste("Rendement", culture, "(kg/ha)"),
+    ylab = "Incidence pauvreté",
+    pch = 19, col = "#F8766D"
+  )
+  
+  abline(lm(H_dept ~ data[[var_name]], data = data), 
+         col = "#619CFF", lwd = 2)
+}
+
+par(mfrow = c(1, 1))
+```
+
+**Décision** : Retenir **rend_sorgho** et **rend_mais** (corrélation significative).
+
+## Variables auxiliaires candidates
+```{r}
+# Définir liste initiale (toutes variables RGPH-5)
+var_auxiliaires_init <- c(
+  "alpha_pct",
+  "taux_emploi_pct",
+  "ratio_dep",
+  "handicap_pct",
+  "elec_pct",
+  "eau_pct",
+  "toilette_pct",
+  "logt_pct",
+  "equip_dep",
+  "insa_alim_pct",
+  "dist_hopital",
+  "dist_ecole",
+  "densite_pop",
+  "night_light",
+  "dist_roads",
+  "rend_sorgho",
+  "rend_mais"
+)
+
+cat("Variables auxiliaires candidates :", length(var_auxiliaires_init), "\n")
+```
+
+## Corrélations avec H_dept
+```{r}
+# Calculer corrélations
+cor_pauvrete <- cor(
+  data[, var_auxiliaires_init], 
+  data$H_dept, 
+  use = "complete.obs"
+)
+
+# Tableau
+cor_df <- data.frame(
+  Variable = rownames(cor_pauvrete),
+  Correlation = cor_pauvrete[, 1],
+  Abs_Correlation = abs(cor_pauvrete[, 1])
+) %>%
+  arrange(desc(Abs_Correlation))
+
+print(cor_df)
+```
+
+### Visualisation des corrélations
+```{r fig.width=10, fig.height=6}
+ggplot(cor_df, aes(x = reorder(Variable, Correlation), y = Correlation)) +
+  geom_col(aes(fill = Correlation > 0), width = 0.7) +
+  geom_hline(yintercept = c(-0.3, 0.3), 
+             linetype = "dashed", color = "red", linewidth = 1) +
+  coord_flip() +
+  scale_fill_manual(
+    values = c("TRUE" = "#05716C", "FALSE" = "#1976D2"),
+    guide = "none"
+  ) +
+  labs(
+    title = "Corrélations des variables auxiliaires avec la pauvreté",
+    subtitle = "Seuil de sélection : |r| ≥ 0.30",
+    x = "",
+    y = "Corrélation de Pearson"
+  ) +
+  theme_minimal()
+```
+
+## ÉTAPE 1 : Filtrage par corrélation
+```{r}
+# Retenir |r| >= 0.30
+seuil_corr <- 0.30
+
+var_etape1 <- cor_df %>%
+  filter(Abs_Correlation >= seuil_corr) %>%
+  pull(Variable)
+
+cat("=== ÉTAPE 1 : FILTRAGE PAR CORRÉLATION ===\n")
+cat("Seuil : |r| ≥", seuil_corr, "\n")
+cat("Variables retenues :", length(var_etape1), "/", length(var_auxiliaires_init), "\n\n")
+print(var_etape1)
+```
+
+
+## ÉTAPE 2 : Élimination multicolinéarité (VIF)
+
+**Objectif** : Éliminer les variables redondantes (VIF < 10).  
+**Méthode** : Itérations successives jusqu'à convergence.
+
+### Itération 1 : Toutes variables
+```{r}
+formula_vif1 <- as.formula(paste("H_dept ~", paste(var_etape1, collapse = " + ")))
+modele_vif1 <- lm(formula_vif1, data = data)
+
+vif_values1 <- vif(modele_vif1)
+
+vif_df1 <- data.frame(
+  Variable = names(vif_values1),
+  VIF = vif_values1
+) %>%
+  arrange(desc(VIF))
+
+cat("=== ITÉRATION 1 : VIF ===\n")
+print(vif_df1)
+
+# Graphique
+ggplot(vif_df1, aes(x = reorder(Variable, VIF), y = VIF)) +
+  geom_col(aes(fill = VIF > 10)) +
+  geom_hline(yintercept = c(5, 10), 
+             linetype = "dashed", 
+             color = c("orange", "red"), 
+             linewidth = 1) +
+  coord_flip() +
+  scale_fill_manual(
+    values = c("FALSE" = "#05716C", "TRUE" = "#D32F2F"),
+    labels = c("VIF acceptable", "VIF > 10 (problématique)")
+  ) +
+  labs(
+    title = "Variance Inflation Factors (VIF) - Itération 1",
+    subtitle = "VIF > 10 -> Forte multicolinéarité à éliminer",
+    x = "",
+    y = "VIF",
+    fill = "Statut"
+  ) +
+  theme_minimal()
+```
+
+**Décision** : Éliminer `equip_dep` (VIF très élevé, proxy conditions de vie avec `elec_pct` et `toilette_pct`).
+
+```{r}
+var_auxiliaires_finales <- c(
+  "alpha_pct",
+  "taux_emploi_pct",
+  "handicap_pct",
+  "eau_pct",
+  "toilette_pct",
+  "logt_pct",
+  "insa_alim_pct",
+  "dist_hopital",
+  "dist_ecole",
+  "densite_pop",
+  "night_light",
+  "rend_sorgho",
+  "rend_mais"
+)
+  
+formula_vif_final <- as.formula(
+  paste("H_dept ~", paste(var_auxiliaires_finales, collapse = " + "))
+)
+modele_vif_final <- lm(formula_vif_final, data = data)
+
+vif_values_final <- vif(modele_vif_final)
+
+vif_df_final <- data.frame(
+  Variable = names(vif_values_final),
+  VIF = vif_values_final
+) %>%
+  arrange(desc(VIF))
+
+cat("\n=== VIF FINAUX ===\n")
+print(vif_df_final)
+
+# Graphique final
+ggplot(vif_df_final, aes(x = reorder(Variable, VIF), y = VIF)) +
+  geom_col(fill = "#388", width = 0.7) +
+  geom_hline(yintercept = c(5, 10), 
+             linetype = "dashed", 
+             color = c("orange", "red"), 
+             linewidth = 1) +
+  coord_flip() +
+  labs(
+    title = "VIF finaux - Variables auxiliaires sélectionnées",
+    subtitle = "  Toutes variables avec VIF < 10",
+    x = "",
+    y = "VIF"
+  ) +
+  theme_minimal()
+```
+
+**  Variables auxiliaires finales retenues** : `r length(var_auxiliaires_finales)` variables.
+
+## Création des variables transformées
+```{r}
+data <- data %>%
+  mutate(
+    # Transformation 1 : AUCUNE (H brut)
+    H_none = H_dept,
+    var_none = data$var_H,
+    
+    # Transformation 2 : LOGIT
+    # θ = logit(H) = log(H / (1-H))
+    H_logit = qlogis(H_dept),
+    var_logit = data$var_H / ((H_dept^2) * ((1 - H_dept)^2)),  # Méthode delta
+    
+    # Transformation 3 : ARCSIN (pour proportions)
+    # θ = arcsin(√H)
+    H_arcsin = asin(sqrt(H_dept)),
+    var_arcsin = data$var_H / (4 * H_dept * (1 - H_dept)),  # Méthode delta
+    
+    # Transformation 4 : LOG
+    # θ = log(H)
+    H_log = log(H_dept),
+    var_log = data$var_H / (H_dept^2)  # Méthode delta
+  )
+
+cat("  Transformations créées\n\n")
+
+# Vérifier cohérence
+cat("=== VÉRIFICATION TRANSFORMATIONS ===\n")
+cat("H_none (brut)   : min =", round(min(data$H_none), 3), 
+    ", max =", round(max(data$H_none), 3), "\n")
+cat("H_logit         : min =", round(min(data$H_logit), 3), 
+    ", max =", round(max(data$H_logit), 3), "\n")
+cat("H_arcsin        : min =", round(min(data$H_arcsin), 3), 
+    ", max =", round(max(data$H_arcsin), 3), "\n")
+cat("H_log           : min =", round(min(data$H_log), 3), 
+    ", max =", round(max(data$H_log), 3), "\n")
+```
+
+
+# ESTIMATION & COMPARAISON DES MODÈLES
+
+**Objectif** : Estimer les 4 modèles FH et **comparer leurs performances**.  
+**Critères** :  
+1. **Normalité résidus** (priorité 1 - validité statistique)  
+2. **AIC/BIC** (priorité 2 - ajustement)  
+3. **R² et MSE** (priorité 3 - qualité prédictive)
+
+
+
+
+## Modèle 1 : AUCUNE transformation
+```{r}
+cat("=== MODÈLE 1 : H BRUT ===\n")
+
+formule_none <- as.formula(
+  paste("H_dept ~", paste(var_auxiliaires_finales, collapse = " + "))
+)
+
+model_none <- fh(
+  fixed = formule_none,
+  vardir = "variance_directe",
+  combined_data = data,
+  domains = "departement",
+  transformation = "no",
+  backtransformation = "naive",
+  MSE = TRUE,
+  mse_type = "analytical"
+)
+
+summary(model_none)
+
+```
+
+
+```{r}
+## Normalité des effets aléatoires
+effets_aleatoires_none <- model_none$model$random_effects
+
+# Test de Shapiro-Wilk
+sw_ea <- shapiro.test(effets_aleatoires_none)
+
+# Test de Jarque-Bera
+jb_ea <- jarque.bera.test(effets_aleatoires_none)
+
+# Test d'Anderson-Darling
+ad_ea <- ad.test(effets_aleatoires_none)
+
+cat("=== NORMALITÉ DES EFFETS ALÉATOIRES ===\n")
+cat("Test de Shapiro-Wilk :\n")
+cat("  W =", round(sw_ea$statistic, 4), "\n")
+cat("  p =", round(sw_ea$p.value, 4), "\n")
+cat("  Conclusion :", 
+    ifelse(sw_ea$p.value > 0.05, 
+           "  Normalité acceptée", 
+           "✗ Normalité rejetée -> Problème modèle"), "\n")
+
+cat("\n1. Test de Jarque-Bera (Asymétrie & Kurtosis) :\n")
+cat("   X-squared =", round(jb_ea$statistic, 4), "\n")
+cat("   p-value   =", round(jb_ea$p.value, 4), "\n")
+cat("   Conclusion:", ifelse(jb_ea$p.value > 0.05, "  Normalité acceptée", "✗ Normalité rejetée"), "\n")
+
+cat("\n2. Test d'Anderson-Darling (Sensible aux queues) :\n")
+cat("   A =", round(ad_ea$statistic, 4), "\n")
+cat("   p-value =", round(ad_ea$p.value, 4), "\n")
+cat("   Conclusion:", ifelse(ad_ea$p.value > 0.05, "  ormalité acceptée", "✗ Normalité rejetée"), "\n")
+
+
+# Graphique de contrôle visuel
+par(mfrow = c(1, 2))
+hist(effets_aleatoires_none, main = "Histogramme des u_d", col = "lightblue", border = "white")
+qqnorm(effets_aleatoires_none, main = "Q-Q Plot des u_d") 
+qqline(effets_aleatoires_none, col = "#D32F2F")
+```
+```{r}
+# récupération des CV
+# 1. Vérifiez la structure du modèle
+#str(model_logit, max.level = 2)
+
+# 2. EXTRACTION CORRECTE des CV (emdi)
+ 
+data$CV_none <- sqrt(model_none$MSE$FH) / model_none$ind$FH # Vérification 
+print(data$CV_none)
+```
+
+```{r}
+# Représentation graphique des CV direct et CV FH en fonction des départements
+data_sorted <- data %>% 
+  arrange(n_effectif) %>%
+  mutate(departement = factor(departement, levels = unique(departement)))
+
+ggplot(data, aes(x = departement, group = 1 )) +
+  geom_line(aes(y = cv_H, color = "Directs"), linewidth = 1.2) +
+  geom_line(aes(y = CV_none, color = "Estimés"), linewidth = 1.2) +
+  scale_color_manual(
+    values = c("Directs" = "#D32F2F", "Estimés" = "#1976D2")
+  ) +
+  labs(
+    title = "CV DIRECTS VS CV ESTIMES",
+    x = "Départements (ordonnés par taille échantillon)",
+    y = "CV",
+    color = "Type"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 8) 
+
+    )
+```
+
+
+```{r}
+# 1. Extraction des indicateurs FH (MSE et CV inclus)
+# La fonction estimators() crée un tableau propre avec les résultats du modèle
+res_fh <- estimators(model_none, indicator = "FH", MSE = TRUE, CV = TRUE)$ind
+
+# 2. Préparation de la fusion avec les données directes
+# On sélectionne uniquement les colonnes nécessaires dans votre base 'data'
+# On suppose que la colonne des domaines s'appelle "departement"
+data_direct <- data[, c("departement", "cv_H", "vardirect")]
+
+# 3. Fusion (Merge) par domaine
+# On utilise "Domain" (nom par défaut dans emdi) et "departement" (votre base)
+df_comparatif <- merge(
+  x = res_fh, 
+  y = data_direct, 
+  by.x = "Domain", 
+  by.y = "departement"
+)
+
+# 4. Calcul des gains de précision
+# Gain sur la MSE : Ratio entre variance directe et variance du modèle
+df_comparatif$Gain_MSE <- df_comparatif$vardirect / df_comparatif$FH_MSE
+
+# Gain sur le CV (en %) : Réduction relative de l'imprécision
+df_comparatif$Reduction_CV_Pct <- (1 - (df_comparatif$FH_CV / df_comparatif$cv_H)) * 100
+
+# 5. Affichage des résultats synthétiques
+cat("=== SYNTHÈSE DU GAIN DE PRÉCISION NONE ===\n")
+cat("Réduction moyenne du CV :", round(mean(df_comparatif$Reduction_CV_Pct, na.rm = TRUE), 2), "%\n")
+cat("Gain moyen sur la MSE (Ratio) :", round(mean(df_comparatif$Gain_MSE, na.rm = TRUE), 2), "\n")
+
+# Affichage des 10 premières lignes
+print("--- TOP 10 PREMIÈRES LIGNES ---")
+print(head(df_comparatif[, c("Domain", "cv_H", "FH_CV", "Reduction_CV_Pct")], n = 45))
+
+# Affichage des 10 départements où le gain est le plus fort
+print("--- TOP 10 DES MEILLEURS GAINS ---")
+print(head(df_comparatif[order(-df_comparatif$Reduction_CV_Pct), c("Domain", "Reduction_CV_Pct")], n = 45))
+
+```
+
+## Modèle 2 : LOGIT
+```{r message=FALSE, warning=FALSE, include=FALSE}
+cat("\n=== MODÈLE 2 : LOGIT ===\n")
+
+formule_logit <- as.formula(
+  paste("H_dept ~", paste(var_auxiliaires_finales, collapse = " + "))
+)
+model_logit <- fh(
+  fixed = formule_logit,
+  vardir = "vardirect",
+  combined_data = data,
+  domains = "departement",
+  
+  transformation = "logit",
+  backtransformation = "bc",
+  eff_smpsize = "n_effectif",
+  MSE = TRUE,
+  mse_type = "boot",
+  B = 500
+)
+```
+
+```{r}
+summary(model_logit)
+```
+```{r}
+plot(model_logit)
+```
+
+
+### Test de normalité
+```{r}
+## Normalité des effets aléatoires
+effets_aleatoires_logit <- model_logit$model$random_effects
+
+# Test de Shapiro-Wilk
+sw_ea <- shapiro.test(effets_aleatoires_logit)
+
+# Test de Jarque-Bera
+jb_ea <- jarque.bera.test(effets_aleatoires_logit)
+
+# Test d'Anderson-Darling
+ad_ea <- ad.test(effets_aleatoires_logit)
+
+cat("=== NORMALITÉ DES EFFETS ALÉATOIRES ===\n")
+cat("Test de Shapiro-Wilk :\n")
+cat("  W =", round(sw_ea$statistic, 4), "\n")
+cat("  p =", round(sw_ea$p.value, 4), "\n")
+cat("  Conclusion :", 
+    ifelse(sw_ea$p.value > 0.05, 
+           "  Normalité acceptée", 
+           "✗ Normalité rejetée -> Problème modèle"), "\n")
+
+cat("\n1. Test de Jarque-Bera (Asymétrie & Kurtosis) :\n")
+cat("   X-squared =", round(jb_ea$statistic, 4), "\n")
+cat("   p-value   =", round(jb_ea$p.value, 4), "\n")
+cat("   Conclusion:", ifelse(jb_ea$p.value > 0.05, "  Normalité acceptée", "✗ Normalité rejetée"), "\n")
+
+cat("\n2. Test d'Anderson-Darling (Sensible aux queues) :\n")
+cat("   A =", round(ad_ea$statistic, 4), "\n")
+cat("   p-value =", round(ad_ea$p.value, 4), "\n")
+cat("   Conclusion:", ifelse(ad_ea$p.value > 0.05, "  Normalité acceptée", "✗ Normalité rejetée"), "\n")
+
+
+# Graphique de contrôle visuel
+par(mfrow = c(1, 2))
+
+hist(effets_aleatoires_logit, main = "Histogramme des u_d", col = "lightblue", border = "white")
+
+qqnorm(effets_aleatoires_logit, main = "Q-Q Plot des u_d")
+qqline(effets_aleatoires_logit, col = "#1976D2")
+```
+```{r}
+# récupération des CV
+# 1. Vérifiez la structure du modèle
+#str(model_logit, max.level = 2)
+
+# 2. EXTRACTION CORRECTE des CV (emdi)
+ 
+data$CV_logit <- sqrt(model_logit$MSE$FH) / model_logit$ind$FH # Vérification 
+print(data$CV_logit)
+```
+
+
+```{r}
+# Représentation graphique des CV direct et CV FH en fonction des départements
+data_sorted <- data %>% 
+  arrange(n_echantillon) %>%
+  mutate(index = row_number())
+
+
+ggplot(data_sorted, aes(x = index)) +
+  geom_line(aes(y = cv_H, color = "Directs"), linewidth = 1.2) +
+  geom_line(aes(y = CV_logit, color = "Estimés"), linewidth = 1.2) +
+  scale_color_manual(
+    values = c("Directs" = "#D32F2F", "Estimés" = "#1976D2")
+  ) +
+  labs(
+    title = "Variance des erreurs d'échantillonnage : directe vs lissée",
+    subtitle = "Le lissage GVF stabilise les estimations entre départements",
+    x = "Départements (ordonnés par taille échantillon)",
+    y = "Variance",
+    color = "Type"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "top")
+```
+
+```{r}
+# 1. On s'assure que la colonne nom est un facteur ordonné selon n_echantillon
+data_sorted <- data %>% 
+  arrange(n_echantillon) %>%
+  # Remplacez 'DEPT' par le nom exact de votre colonne département
+  mutate(departement = factor(departement, levels = departement)) 
+
+# 2. Graphique
+ggplot(data_sorted, aes(x = departement)) + # On utilise DEPT au lieu d'index
+  geom_line(aes(y = cv_H, color = "Directs", group = 1), linewidth = 1.2) +
+  geom_line(aes(y = CV_logit, color = "Estimés", group = 1), linewidth = 1.2) +
+  scale_color_manual(
+    values = c("Directs" = "#D32F2F", "Estimés" = "#1976D2")
+  ) +
+  labs(
+    title = "Variance des erreurs d'échantillonnage : directe vs lissée",
+    subtitle = "Le lissage GVF stabilise les estimations entre départements",
+    x = "Départements (ordonnés par taille d'échantillon)",
+    y = "Variance",
+    color = "Type"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    # Rotation des noms pour qu'ils soient lisibles
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 8) 
+  )
+```
+
+
+
+### Gain de précision
+```{r}
+# 1. Extraction des indicateurs FH (MSE et CV inclus)
+# La fonction estimators() crée un tableau propre avec les résultats du modèle
+res_fh <- estimators(model_logit, indicator = "FH", MSE = TRUE, CV = TRUE)$ind
+
+# 2. Préparation de la fusion avec les données directes
+# On sélectionne uniquement les colonnes nécessaires dans votre base 'data'
+# On suppose que la colonne des domaines s'appelle "departement"
+data_direct <- data[, c("departement", "cv_H", "vardirect")]
+
+# 3. Fusion (Merge) par domaine
+# On utilise "Domain" (nom par défaut dans emdi) et "departement" (votre base)
+df_comparatif <- merge(
+  x = res_fh, 
+  y = data_direct, 
+  by.x = "Domain", 
+  by.y = "departement"
+)
+
+# 4. Calcul des gains de précision
+# Gain sur la MSE : Ratio entre variance directe et variance du modèle
+df_comparatif$Gain_MSE <- df_comparatif$vardirect / df_comparatif$FH_MSE
+
+# Gain sur le CV (en %) : Réduction relative de l'imprécision
+df_comparatif$Reduction_CV_Pct <- (1 - (df_comparatif$FH_CV / df_comparatif$cv_H)) * 100
+
+# 5. Affichage des résultats synthétiques
+cat("=== SYNTHÈSE DU GAIN DE PRÉCISION LOGIT ===\n")
+cat("Réduction moyenne du CV :", round(mean(df_comparatif$Reduction_CV_Pct, na.rm = TRUE), 2), "%\n")
+cat("Gain moyen sur la MSE (Ratio) :", round(mean(df_comparatif$Gain_MSE, na.rm = TRUE), 2), "\n")
+
+# Affichage des premières lignes
+print("--- TOP 10 PREMIÈRES LIGNES ---")
+print(head(df_comparatif[, c("Domain", "cv_H", "FH_CV", "Reduction_CV_Pct")], n = 45))
+
+# Affichage des départements où le gain est le plus fort
+print("--- TOP 10 DES MEILLEURS GAINS ---")
+print(head(df_comparatif[order(-df_comparatif$Reduction_CV_Pct), c("Domain", "Reduction_CV_Pct")], n = 45))
+
+```
+
+
+
+## Modèle 3 : ARCSIN
+```{r message=FALSE, warning=FALSE, include=FALSE}
+cat("\n=== MODÈLE 3 : ARCSIN ===\n")
+
+formule_arcsin <- as.formula(
+  paste("H_dept ~", paste(var_auxiliaires_finales, collapse = " + "))
+)
+
+model_arcsin <- fh(
+  fixed = formule_arcsin,
+  vardir = "var_H",
+  combined_data = data,
+  domains = "departement",
+  transformation = "arcsin",
+  backtransformation = "bc",
+  eff_smpsize = "n_effectif",
+  MSE = TRUE,
+  mse_type = "boot",
+  B = 500
+)
+```
+
+
+```{r}
+summary(model_arcsin)
+
+```
+```{r}
+plot(model_arcsin)
+```
+
+
+```{r}
+## Normalité des effets aléatoires
+effets_aleatoires_arcsin <- model_arcsin$model$random_effects
+
+# Test de Shapiro-Wilk
+sw_ea <- shapiro.test(effets_aleatoires_arcsin)
+
+# Test de Jarque-Bera
+jb_ea <- jarque.bera.test(effets_aleatoires_arcsin)
+
+# Test d'Anderson-Darling
+ad_ea <- ad.test(effets_aleatoires_arcsin)
+
+cat("=== NORMALITÉ DES EFFETS ALÉATOIRES ===\n")
+cat("Test de Shapiro-Wilk :\n")
+cat("  W =", round(sw_ea$statistic, 4), "\n")
+cat("  p =", round(sw_ea$p.value, 4), "\n")
+cat("  Conclusion :", 
+    ifelse(sw_ea$p.value > 0.05, 
+           "  Normalité acceptée", 
+           "✗ Normalité rejetée -> Problème modèle"), "\n")
+
+cat("\n1. Test de Jarque-Bera (Asymétrie & Kurtosis) :\n")
+cat("   X-squared =", round(jb_ea$statistic, 4), "\n")
+cat("   p-value   =", round(jb_ea$p.value, 4), "\n")
+cat("   Conclusion:", ifelse(jb_ea$p.value > 0.05, "  Normalité acceptée", "✗ Normalité rejetée"), "\n")
+
+cat("\n2. Test d'Anderson-Darling (Sensible aux queues) :\n")
+cat("   A =", round(ad_ea$statistic, 4), "\n")
+cat("   p-value =", round(ad_ea$p.value, 4), "\n")
+cat("   Conclusion:", ifelse(ad_ea$p.value > 0.05, "  Normalité acceptée", "✗ Normalité rejetée"), "\n")
+
+
+# Graphique de contrôle visuel
+par(mfrow = c(1, 2))
+
+# histograme avec la courbe de densité 
+hist(effets_aleatoires_arcsin, main = "Histogramme des effets aléatoires ", col = "#D88", prob = TRUE, border = "white")
+lines(density(effets_aleatoires_arcsin), 
+      col = "darkred",     # Couleur de la ligne
+      lwd = 2)             # Épaisseur de la ligne
+
+
+qqnorm(effets_aleatoires_arcsin, main = "Q-Q Plot des effets aléatoires")
+qqline(effets_aleatoires_arcsin, col = "#388E3C")
+```
+
+```{r}
+
+# 1. EXTRACTION CORRECTE des CV (emdi)
+ 
+data$CV_arcsin <- sqrt(model_arcsin$MSE$FH) / model_arcsin$ind$FH # Vérification 
+print(data$CV_arcsin)
+```
+
+```{r}
+# Représentation graphique des CV direct et CV FH en fonction des départements
+data_sorted <- data %>% 
+  arrange(n_echantillon) %>%
+  # Remplacez 'DEPT' par le nom exact de votre colonne département
+  mutate(departement = factor(departement, levels = unique(departement))) 
+
+
+ggplot(data_sorted, aes(x = departement, group = 1)) +
+  geom_line(aes(y = cv_H, color = "Directs"), linewidth = 1.2) +
+  geom_line(aes(y = CV_arcsin, color = "Estimés"), linewidth = 1.2) +
+  scale_color_manual(
+    values = c("Directs" = "#D32F2F", "Estimés" = "#1976D2")
+  ) +
+  labs(
+    title = "Comparaison des cv directs et estimés ",
+    subtitle = "Estimation FH , transformation Arcsin",
+    x = "Départements (ordonnés par taille échantillon)",
+    y = "CV",
+    color = "Type"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 8)
+    )
+```
+
+### Gain de précision
+```{r}
+# 1. Extraction des indicateurs FH (MSE et CV inclus)
+# La fonction estimators() crée un tableau propre avec les résultats du modèle
+res_fh <- estimators(model_arcsin, indicator = "FH", MSE = TRUE, CV = TRUE)$ind
+
+# 2. Préparation de la fusion avec les données directes
+# On sélectionne uniquement les colonnes nécessaires dans votre base 'data'
+# On suppose que la colonne des domaines s'appelle "departement"
+data_direct <- data[, c("departement", "cv_H", "vardirect")]
+
+# 3. Fusion (Merge) par domaine
+# On utilise "Domain" (nom par défaut dans emdi) et "departement" (votre base)
+df_comparatif <- merge(
+  x = res_fh, 
+  y = data_direct, 
+  by.x = "Domain", 
+  by.y = "departement"
+)
+
+# 4. Calcul des gains de précision
+# Gain sur la MSE : Ratio entre variance directe et variance du modèle
+df_comparatif$Gain_MSE <- df_comparatif$vardirect / df_comparatif$FH_MSE
+
+# Gain sur le CV (en %) : Réduction relative de l'imprécision
+df_comparatif$Reduction_CV_Pct <- (1 - (df_comparatif$FH_CV / df_comparatif$cv_H)) * 100
+
+# 5. Affichage des résultats synthétiques
+cat("=== SYNTHÈSE DU GAIN DE PRÉCISION ARCSIN ===\n")
+cat("Réduction moyenne du CV :", round(mean(df_comparatif$Reduction_CV_Pct, na.rm = TRUE), 2), "%\n")
+cat("Gain moyen sur la MSE (Ratio) :", round(mean(df_comparatif$Gain_MSE, na.rm = TRUE), 2), "\n")
+
+# Affichage des 10 premières lignes
+print("--- TOP 10 PREMIÈRES LIGNES ---")
+print(head(df_comparatif[, c("Domain", "cv_H", "FH_CV", "Reduction_CV_Pct")], n = 45))
+
+# Affichage des 10 départements où le gain est le plus fort
+print("--- TOP 10 DES MEILLEURS GAINS ---")
+print(head(df_comparatif[order(-df_comparatif$Reduction_CV_Pct), c("Domain", "Reduction_CV_Pct")], n = 45))
+
+```
+
+
+
+
+## GRAPHIQUES COMPARATIFS
+
+### Q-Q Plots des 3 modèles
+```{r fig.width=12, fig.height=10}
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+
+# Modèle 1 : Aucune
+resid_none <- model_none$model$random_effects
+qqnorm(resid_none, main = "Q-Q Plot : Aucune transformation")
+qqline(resid_none, col = "#D32F2F", lwd = 2)
+
+# Modèle 2 : Logit
+resid_logit <- model_logit$model$random_effects
+qqnorm(resid_logit, main = "Q-Q Plot : Logit")
+qqline(resid_logit, col = "#1976D2", lwd = 2)
+
+# Modèle 3 : Arcsin
+resid_arcsin <- model_arcsin$model$random_effects
+qqnorm(resid_arcsin, main = "Q-Q Plot : Arcsin")
+qqline(resid_arcsin, col = "#388E3C", lwd = 2)
+
+par(mfrow = c(1, 1))
+```
+
+
+
+# DIAGNOSTICS APPROFONDIS DU MODÈLE FINAL
+
+**Objectif** : Valider les **hypothèses du modèle Fay-Herriot**.
+
+## Normalité des effets aléatoires
+
+#### Pour le modèle arcsin 
+```{r fig.width=10, fig.height=5}
+# Extraire effets aléatoires
+effets_aleatoires_arcsin <- model_arcsin$model$random_effects
+
+# Test de Shapiro-Wilk
+sw_ea <- shapiro.test(effets_aleatoires_arcsin)
+
+cat("=== NORMALITÉ DES EFFETS ALÉATOIRES ===\n")
+cat("Test de Shapiro-Wilk :\n")
+cat("  W =", round(sw_ea$statistic, 4), "\n")
+cat("  p =", round(sw_ea$p.value, 4), "\n")
+cat("  Conclusion :", 
+    ifelse(sw_ea$p.value > 0.05, 
+           "  Normalité acceptée ", 
+           "✗ Normalité rejetée -> Problème modèle"), "\n")
+
+
+```
+
+```{r fig.width=10, fig.height=5}
+# Q-Q plot
+par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+
+qqnorm(effets_aleatoires_arcsin, main = "Q-Q Plot - Effets aléatoires")
+qqline(effets_aleatoires_arcsin, col = "#D32F2F", lwd = 2)
+
+# Histogramme
+hist(effets_aleatoires_arcsin, breaks = 10, col = "#D88", prob=TRUE, border = "white",
+     main = "Distribution des effets aléatoires",
+     xlab = "Effets aléatoires")
+lines(density(effets_aleatoires_arcsin), 
+      col = "darkred",     # Couleur de la ligne
+      lwd = 2)             # Épaisseur de la ligne
+
+par(mfrow = c(1, 1))
+```
+
+#### Pour le modèle logit
+
+```{r fig.width=10, fig.height=5}
+# Extraire effets aléatoires
+effets_aleatoires_logit <- model_logit$model$random_effects
+
+# Test de Shapiro-Wilk
+sw_ea <- shapiro.test(effets_aleatoires_logit)
+
+cat("=== NORMALITÉ DES EFFETS ALÉATOIRES ===\n")
+cat("Test de Shapiro-Wilk :\n")
+cat("  W =", round(sw_ea$statistic, 4), "\n")
+cat("  p =", round(sw_ea$p.value, 4), "\n")
+cat("  Conclusion :", 
+    ifelse(sw_ea$p.value > 0.05, 
+           "  Normalité acceptée ", 
+           "✗ Normalité rejetée -> Problème modèle"), "\n")
+
+
+```
+
+```{r fig.width=10, fig.height=5}
+# Q-Q plot
+par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+
+qqnorm(effets_aleatoires_logit, main = "Q-Q Plot - Effets aléatoires")
+qqline(effets_aleatoires_logit, col = "#1976D2", lwd = 2)
+
+# Histogramme
+hist(effets_aleatoires_logit, breaks = 10, col = "lightblue",prob=TRUE, border = "white",
+     main = "Distribution des effets aléatoires",
+     xlab = "Effets aléatoires")
+lines(density(effets_aleatoires_logit), 
+      col = "#1976D2",     # Couleur de la ligne
+      lwd = 2)             # Épaisseur de la ligne
+
+
+par(mfrow = c(1, 1))
+```
+
+
+## Test d'indépendance : Effets aléatoires et RMSE
+
+**Hypothèse FH** : Les effets aléatoires doivent être **indépendants** de la précision (RMSE).
+
+#### Pour le modèle arcsin
+
+```{r}
+# Calculer RMSE
+rmse_arcsin <- sqrt(model_arcsin$MSE$FH)
+
+# Test de corrélation de Pearson
+test_indep_arcsin <- cor.test(effets_aleatoires_arcsin, rmse_arcsin, method = "pearson")
+
+cat("\n=== TEST D'INDÉPENDANCE EA et RMSE ===\n")
+cat("Corrélation de Pearson :\n")
+cat("  r =", round(test_indep_arcsin$estimate, 4), "\n")
+cat("  p =", round(test_indep_arcsin$p.value, 4), "\n")
+cat("  Conclusion :", 
+    ifelse(test_indep_arcsin$p.value > 0.05, 
+           "  Indépendance acceptée (p > 0.05)", 
+           "✗ Corrélation détectée -> Problème modèle"), "\n")
+
+# Graphique
+plot(rmse_arcsin, effets_aleatoires_arcsin,
+     main = "Indépendance : Effets aléatoires vs RMSE",
+     xlab = "RMSE (Racine MSE)",
+     ylab = "Effets aléatoires",
+     pch = 19, col = "#D88")
+abline(h = 0, col = "#D32F2F", lty = 2, lwd = 2)
+abline(lm(effets_aleatoires_arcsin ~ rmse_arcsin), col = "#1976D2", lwd = 2)
+legend("topright", 
+       legend = c("Ligne y=0", "Régression linéaire"),
+       col = c("#D32F2F", "#1976D2"), 
+       lty = c(2, 1), lwd = 2)
+```
+#### Pour le modèle logit
+
+```{r}
+# Calculer RMSE
+rmse_logit <- sqrt(model_logit$MSE$FH)
+
+# Test de corrélation de Pearson
+test_indep_logit <- cor.test(effets_aleatoires_logit, rmse_logit, method = "pearson")
+
+cat("\n=== TEST D'INDÉPENDANCE EA et RMSE ===\n")
+cat("Corrélation de Pearson :\n")
+cat("  r =", round(test_indep_logit$estimate, 4), "\n")
+cat("  p =", round(test_indep_logit$p.value, 4), "\n")
+cat("  Conclusion :", 
+    ifelse(test_indep_logit$p.value > 0.05, 
+           "  Indépendance acceptée (p > 0.05)", 
+           "✗ Corrélation détectée -> Problème modèle"), "\n")
+
+# Graphique
+plot(rmse_logit, effets_aleatoires_logit,
+     main = "Indépendance : Effets aléatoires vs RMSE",
+     xlab = "RMSE (Racine MSE)",
+     ylab = "Effets aléatoires",
+     pch = 19, col = "#1976D2")
+abline(h = 0, col = "#D32F2F", lty = 2, lwd = 2)
+abline(lm(effets_aleatoires_logit ~ rmse_logit), col = "lightblue", lwd = 2)
+legend("topright", 
+       legend = c("Ligne y=0", "Régression linéaire"),
+       col = c("#D32F2F", "lightblue"), 
+       lty = c(2, 1), lwd = 2)
+```
+
+## Test d'homoscédasticité 
+
+#### Test d'homoscédasticité des erreurs du modèle (ARCSIN)
+```{r}
+# Extraire les résidus du modèle
+resid_arcsin <- model_arcsin$model$real_residuals
+fitted_arcsin <- model_arcsin$model$fitted
+
+# Test de Breusch-Pagan
+test_data_arcsin <- data.frame(
+  residuals = resid_arcsin,
+  fitted = fitted_arcsin
+)
+
+lm_hetero_arcsin <- lm(I(residuals^2) ~ fitted, data = test_data_arcsin)
+bp_test_arcsin <- bptest(lm_hetero_arcsin)
+
+cat("=== TEST D'HOMOSCÉDASTICITÉ DES ERREURS DU MODÈLE (ARCSIN) ===\n")
+cat("Test de Breusch-Pagan :\n")
+cat("  Statistique BP =", round(bp_test_arcsin$statistic, 4), "\n")
+cat("  p-value        =", round(bp_test_arcsin$p.value, 4), "\n")
+cat("  Conclusion     :", 
+    ifelse(bp_test_arcsin$p.value > 0.05, 
+           "  Homoscédasticité acceptée", 
+           "✗ Hétéroscédasticité détectée"), "\n")
+```
+```{r fig.width=8, fig.height=5}
+# Graphique diagnostique
+plot(fitted_arcsin, resid_arcsin^2,
+     main = "Test d'homoscédasticité des erreurs - ARCSIN",
+     xlab = "Valeurs ajustées",
+     ylab = "Résidus au carré",
+     pch = 19, col = "#1976D2")
+abline(h = mean(resid_arcsin^2), col = "#D32F2F", lwd = 2, lty = 2)
+lines(lowess(fitted_arcsin, resid_arcsin^2), col = "#1976D2", lwd = 2)
+```
+
+
+#### Modèle LOGIT
+
+```{r}
+# Extraire les résidus du modèle (erreurs)
+resid_logit <- model_logit$model$real_residuals
+fitted_logit <- model_logit$model$fitted
+
+# Test de Breusch-Pagan
+test_data_logit <- data.frame(
+  residuals = resid_logit,
+  fitted = fitted_logit
+)
+
+lm_hetero_logit <- lm(I(residuals^2) ~ fitted, data = test_data_logit)
+bp_test_logit <- bptest(lm_hetero_logit)
+
+cat("=== TEST D'HOMOSCÉDASTICITÉ DES ERREURS DU MODÈLE (LOGIT) ===\n")
+cat("Test de Breusch-Pagan :\n")
+cat("  Statistique BP =", round(bp_test_logit$statistic, 4), "\n")
+cat("  p-value        =", round(bp_test_logit$p.value, 4), "\n")
+cat("  Conclusion     :", 
+    ifelse(bp_test_logit$p.value > 0.05, 
+           "  Homoscédasticité acceptée", 
+           "✗ Hétéroscédasticité détectée"), "\n")
+```
+```{r fig.width=8, fig.height=5}
+# Graphique diagnostique
+plot(fitted_logit, resid_logit^2,
+     main = "Test d'homoscédasticité des erreurs - LOGIT",
+     xlab = "Valeurs ajustées",
+     ylab = "Résidus au carré",
+     pch = 19, col = "#1976D2")
+abline(h = mean(resid_logit^2), col = "#D32F2F", lwd = 2, lty = 2)
+lines(lowess(fitted_logit, resid_logit^2), col = "#1976D2", lwd = 2)
+```
+
+
+## Résidus standardisés
+
+#### Pour le modèle arcsin
+
+```{r fig.width=12, fig.height=5}
+# Extraire résidus
+resid_std_arcsin <- model_arcsin$model$std_real_residuals
+fitted_arcsin <- model_arcsin$model$fitted
+
+par(mfrow = c(1, 3), mar = c(4, 4, 3, 1))
+
+# 1. Q-Q plot
+qqnorm(resid_std_arcsin, main = "Q-Q Plot - Résidus standardisés modèle arcsin")
+qqline(resid_std_arcsin, col = "#D32F2F", lwd = 2)
+
+# 2. Histogramme
+hist(resid_std_arcsin, breaks = 5, col = "#D88", prob=TRUE,border = "white",
+     main = "Distribution des résidus",
+     xlab = "Résidus standardisés modèle arcsin")
+lines(density(resid_std_arcsin), 
+      col = "darkred",     # Couleur de la ligne
+      lwd = 2)             # Épaisseur de la ligne
+
+# 3. Résidus vs Fitted
+plot(fitted_arcsin, resid_std_arcsin,
+     main = "Résidus vs Valeurs ajustées modèle arcsin",
+     xlab = "Valeurs ajustées", 
+     ylab = "Résidus standardisés",
+     pch = 19, col = "gray30")
+abline(h = 0, col = "#D32F2F", lwd = 2)
+
+par(mfrow = c(1, 1))
+```
+
+```{r}
+# Test de Shapiro-Wilk
+sw_ea <- shapiro.test(resid_std_arcsin)
+
+cat("=== NORMALITÉ DES EFFETS ALÉATOIRES ===\n")
+cat("Test de Shapiro-Wilk :\n")
+cat("  W =", round(sw_ea$statistic, 4), "\n")
+cat("  p =", round(sw_ea$p.value, 4), "\n")
+```
+
+
+#### Pour le modèle logit
+
+```{r fig.width=12, fig.height=5}
+# Extraire résidus
+resid_std_logit <- model_logit$model$std_real_residuals
+fitted_logit <- model_logit$model$fitted
+
+par(mfrow = c(1, 3), mar = c(4, 4, 3, 1))
+
+# 1. Q-Q plot
+qqnorm(resid_std_logit, main = "Q-Q Plot - Résidus standardisés modèle logit")
+qqline(resid_std_logit, col = "#1976D2", lwd = 2)
+
+# 2. Histogramme
+hist(resid_std_logit, breaks = 5, col = "lightblue",prob=TRUE, border = "white",
+     main = "Distribution des résidus",
+     xlab = "Résidus standardisés modèle logit")
+lines(density(resid_std_logit), 
+      col = "#1976D2",     # Couleur de la ligne
+      lwd = 2)             # Épaisseur de la ligne
+
+
+# 3. Résidus vs Fitted
+plot(fitted_logit, resid_std_logit,
+     main = "Résidus vs Valeurs ajustées modèle logit",
+     xlab = "Valeurs ajustées", 
+     ylab = "Résidus standardisés",
+     pch = 19, col = "gray30")
+abline(h = 0, col = "#1976D2", lwd = 2)
+
+par(mfrow = c(1, 1))
+```
+```{r}
+# Test de Shapiro-Wilk
+sw_ea <- shapiro.test(resid_std_logit)
+
+cat("=== NORMALITÉ DES EFFETS ALÉATOIRES ===\n")
+cat("Test de Shapiro-Wilk :\n")
+cat("  W =", round(sw_ea$statistic, 4), "\n")
+cat("  p =", round(sw_ea$p.value, 4), "\n")
+```
+
+## Distance de Cook (valeurs influentes)
+
+#### Pour le modèle arcsin
+
+```{r}
+
+cat("\n=== DISTANCE DE COOK ===\n")
+cat("Calcul des valeurs influentes...\n")
+
+# Extraire coefficients
+Betas <- as.matrix(model_arcsin$model$coefficients[, 1], ncol = 1)
+rownames(Betas) <- rownames(model_arcsin$model$coefficients)
+
+# Matrice de design
+X_design <- as.matrix(cbind(Intercept = 1, data[, var_auxiliaires_finales]))
+
+# Variance du modèle
+sigma_u2 <- model_arcsin$model$variance
+
+# Matrice de poids - CORRECTION: utiliser var_H directement
+V <- diag(1 / (sigma_u2 + data$var_H))
+
+# Calculer Distance de Cook
+D <- nrow(data)
+CD <- numeric(D)
+
+# Barre de progression
+pb <- txtProgressBar(min = 0, max = D, style = 3)
+
+for (i in 1:D) {
+  
+  model_i <- fh(
+    fixed = formule_arcsin,
+    vardir = "vardirect",                      # ← CORRECTION 1
+    combined_data = data[-i, ],
+    domains = "departement",
+    transformation = "arcsin",              # ← CORRECTION 2
+    backtransformation = "bc",             # ← CORRECTION 3 (MANQUAIT !)
+    eff_smpsize = "n_effectif",         # ← CORRECTION 4
+    MSE = FALSE,
+    B=500 # ← Pas de bootstrap = rapide
+  )
+  
+  Betas_i <- as.matrix(model_i$model$coefficients[, 1], ncol = 1)
+  betaDiff <- Betas - Betas_i
+  
+  q <- length(Betas)
+  CD[i] <- (1 / q) * t(betaDiff) %*% (t(X_design) %*% V %*% X_design) %*% betaDiff
+  
+  # Mettre à jour progression
+  setTxtProgressBar(pb, i)
+}
+
+close(pb)
+cat("\n  Calcul terminé\n")
+
+# Graphique
+cook_data <- data.frame(
+  Cook_Distance = CD,
+  Departement = data$departement,
+  Index = 1:D
+)
+
+# Seuil critique
+seuil_cook <- 0.15
+
+ggplot(cook_data, aes(x = Index, y = Cook_Distance)) +
+  geom_point(col = "#D88", size = 2.5) +
+  geom_hline(yintercept = seuil_cook, 
+             col = "#D32F2F", linetype = "dashed", linewidth = 1) +
+  geom_text(
+    aes(label = ifelse(Cook_Distance > seuil_cook, as.character(Departement), "")),
+    hjust = 0, vjust = -0.5, size = 3, col = "gray30"
+  ) +
+  labs(
+    title = "Distance de Cook - Identification des valeurs influentes (Modèle arcsin)",
+    subtitle = paste("Seuil critique :", seuil_cook),
+    x = "Départements (index)",
+    y = "Distance de Cook"
+  ) +
+  theme_minimal()
+
+# Départements influents
+dept_influents <- cook_data %>%
+  filter(Cook_Distance > seuil_cook) %>%
+  arrange(desc(Cook_Distance))
+
+cat("\n=== DÉPARTEMENTS INFLUENTS (Cook >", seuil_cook, ") ===\n")
+if (nrow(dept_influents) > 0) {
+  print(dept_influents, row.names = FALSE)
+  cat("\n⚠ ", nrow(dept_influents), "départements détectés comme influents\n")
+} else {
+  cat("  Aucun département influent détecté\n")
+}
+```
+
+#### Pour le modèle logit
+
+```{r}
+
+cat("\n=== DISTANCE DE COOK ===\n")
+cat("Calcul des valeurs influentes...\n")
+
+# Extraire coefficients
+Betas <- as.matrix(model_logit$model$coefficients[, 1], ncol = 1)
+rownames(Betas) <- rownames(model_logit$model$coefficients)
+
+# Matrice de design
+X_design <- as.matrix(cbind(Intercept = 1, data[, var_auxiliaires_finales]))
+
+# Variance du modèle
+sigma_u2 <- model_logit$model$variance
+
+# Matrice de poids - CORRECTION: utiliser var_H directement
+V <- diag(1 / (sigma_u2 + data$var_H))
+
+# Calculer Distance de Cook
+D <- nrow(data)
+CD <- numeric(D)
+
+# Barre de progression
+pb <- txtProgressBar(min = 0, max = D, style = 3)
+
+for (i in 1:D) {
+  
+  # CORRECTION: Ajouter backtransformation et eff_smpsize
+  model_i <- fh(
+    fixed = formule_logit,
+    vardir = "vardirect",                      # ← CORRECTION 1
+    combined_data = data[-i, ],
+    domains = "departement",
+    transformation = "logit",              # ← CORRECTION 2
+    backtransformation = "bc",             # ← CORRECTION 3 (MANQUAIT !)
+    eff_smpsize = "n_effectif",         # ← CORRECTION 4
+    MSE = FALSE,
+    B=500 # ← Pas de bootstrap = rapide
+  )
+  
+  Betas_i <- as.matrix(model_i$model$coefficients[, 1], ncol = 1)
+  betaDiff <- Betas - Betas_i
+  
+  q <- length(Betas)
+  CD[i] <- (1 / q) * t(betaDiff) %*% (t(X_design) %*% V %*% X_design) %*% betaDiff
+  
+  # Mettre à jour progression
+  setTxtProgressBar(pb, i)
+}
+
+close(pb)
+cat("\nok Calcul terminé\n")
+
+# Graphique
+cook_data <- data.frame(
+  Cook_Distance = CD,
+  Departement = data$departement,
+  Index = 1:D
+)
+
+# Seuil critique
+seuil_cook <- 0.15
+
+ggplot(cook_data, aes(x = Index, y = Cook_Distance)) +
+  geom_point(col = "#1976D2", size = 2.5) +
+  geom_hline(yintercept = seuil_cook, 
+             col = "#D37", linetype = "dashed", linewidth = 1) +
+  geom_text(
+    aes(label = ifelse(Cook_Distance > seuil_cook, as.character(Departement), "")),
+    hjust = 0, vjust = -0.5, size = 3, col = "gray30"
+  ) +
+  labs(
+    title = "Distance de Cook - Identification des valeurs influentes (Modèle Logit)",
+    subtitle = paste("Seuil critique :", seuil_cook),
+    x = "Départements (index)",
+    y = "Distance de Cook"
+  ) +
+  theme_minimal()
+
+# Départements influents
+dept_influents <- cook_data %>%
+  filter(Cook_Distance > seuil_cook) %>%
+  arrange(desc(Cook_Distance))
+
+cat("\n=== DÉPARTEMENTS INFLUENTS (Cook >", seuil_cook, ") ===\n")
+if (nrow(dept_influents) > 0) {
+  print(dept_influents, row.names = FALSE)
+  cat("\n⚠ ", nrow(dept_influents), "départements détectés comme influents\n")
+} else {
+  cat("  Aucun département influent détecté\n")
+}
+```
+
+  
+# MODÈLE RÉDUIT (DÉPARTEMENTS CV > 15%)
+
+**Justification académique** : Départements à faible CV peuvent **compromettre la normalité** des effets aléatoires.  
+```{r}
+cat("=== MODÈLE RÉDUIT (ARCSIN) ===\n\n")
+
+# Filtrer départements avec CV direct > 15%
+seuil_cv_reduit <- 0.20
+data_reduit <- data %>% filter(cv_H < seuil_cv_reduit)
+
+cat("Seuil CV :", seuil_cv_reduit * 100, "%\n")
+cat("Départements modèle complet :", nrow(data), "\n")
+cat("Départements modèle réduit  :", nrow(data_reduit), "\n")
+cat("Départements exclus         :", nrow(data) - nrow(data_reduit), "\n\n")
+```
+
+## Estimation du modèle réduit (ARCSIN)
+```{r message=FALSE, warning=FALSE, include=FALSE}
+model_arcsin_reduit <- fh(
+  fixed = formule_arcsin,
+  vardir = "vardirect",
+  combined_data = data_reduit,
+  domains = "departement",
+  transformation = "arcsin",
+  backtransformation = "bc",
+  eff_smpsize = "n_effectif",
+  MSE = TRUE,
+  mse_type = "boot",
+  B = 500
+)
+```
+
+
+```{r}
+summary(model_arcsin_reduit)
+```
+
+## Diagnostics du modèle réduit
+
+```{r}
+plot(model_arcsin_reduit)
+```
+
+
+### Normalité des effets aléatoires
+```{r}
+effets_aleatoires_reduit <- model_arcsin_reduit$model$random_effects
+
+# Tests de normalité
+sw_reduit <- shapiro.test(effets_aleatoires_reduit)
+jb_reduit <- jarque.bera.test(effets_aleatoires_reduit)
+ad_reduit <- ad.test(effets_aleatoires_reduit)
+
+cat("=== NORMALITÉ DES EFFETS ALÉATOIRES (MODÈLE RÉDUIT) ===\n")
+cat("Test de Shapiro-Wilk :\n")
+cat("  W =", round(sw_reduit$statistic, 4), "\n")
+cat("  p =", round(sw_reduit$p.value, 4), "\n")
+cat("  Conclusion :", 
+    ifelse(sw_reduit$p.value > 0.05, 
+           "  Normalité acceptée", 
+           "✗ Normalité rejetée"), "\n\n")
+
+cat("Test de Jarque-Bera :\n")
+cat("  X-squared =", round(jb_reduit$statistic, 4), "\n")
+cat("  p-value   =", round(jb_reduit$p.value, 4), "\n\n")
+
+cat("Test d'Anderson-Darling :\n")
+cat("  A =", round(ad_reduit$statistic, 4), "\n")
+cat("  p-value =", round(ad_reduit$p.value, 4), "\n")
+
+# Graphiques
+par(mfrow = c(1, 2))
+hist(effets_aleatoires_reduit, main = "Histogramme des u_d (Réduit)", 
+     col = "#D88", border = "white")
+lines(density(effets_aleatoires_reduit), 
+      col = "darkred",     # Couleur de la ligne
+      lwd = 2)             # Épaisseur de la ligne
+
+
+qqnorm(effets_aleatoires_reduit, main = "Q-Q Plot des u_d (Réduit)") 
+qqline(effets_aleatoires_reduit, col = "#388E3C")
+par(mfrow = c(1, 1))
+```
+
+### Test d'indépendance EA et RMSE
+```{r}
+rmse_reduit <- sqrt(model_arcsin_reduit$MSE$FH)
+test_indep_reduit <- cor.test(effets_aleatoires_reduit, rmse_reduit, method = "pearson")
+
+cat("\n=== TEST D'INDÉPENDANCE EA et RMSE (MODÈLE RÉDUIT) ===\n")
+cat("Corrélation de Pearson :\n")
+cat("  r =", round(test_indep_reduit$estimate, 4), "\n")
+cat("  p =", round(test_indep_reduit$p.value, 4), "\n")
+cat("  Conclusion :", 
+    ifelse(test_indep_reduit$p.value > 0.05, 
+           "  Indépendance acceptée", 
+           "✗ Corrélation détectée"), "\n")
+
+# Graphique
+plot(rmse_reduit, effets_aleatoires_reduit,
+     main = "Indépendance : Effets aléatoires vs RMSE (Réduit)",
+     xlab = "RMSE", ylab = "Effets aléatoires",
+     pch = 19, col = "#1976D2")
+abline(h = 0, col = "#D32F2F", lty = 2, lwd = 2)
+abline(lm(effets_aleatoires_reduit ~ rmse_reduit), col = "#D88", lwd = 2)
+```
+
+### Résidus standardisés
+```{r fig.width=12, fig.height=5}
+resid_std_reduit <- model_arcsin_reduit$model$std_real_residuals
+fitted_reduit <- model_arcsin_reduit$model$fitted
+
+sw_resid_reduit <- shapiro.test(resid_std_reduit)
+
+cat("\n=== NORMALITÉ DES RÉSIDUS STANDARDISÉS (MODÈLE RÉDUIT) ===\n")
+cat("Test de Shapiro-Wilk :\n")
+cat("  W =", round(sw_resid_reduit$statistic, 4), "\n")
+cat("  p =", round(sw_resid_reduit$p.value, 4), "\n")
+
+par(mfrow = c(1, 3), mar = c(4, 4, 3, 1))
+
+# 1. Q-Q plot
+qqnorm(resid_std_reduit, main = "Q-Q Plot - Résidus (Réduit)")
+qqline(resid_std_reduit, col = "#1976D2", lwd = 2)
+
+# 2. Histogramme avec courbe de densité
+hist(resid_std_reduit, 
+     breaks = 10, 
+     col = "#D88", 
+     border = "white",
+     probability = TRUE,
+     main = "Distribution résidus (Réduit)",
+     xlab = "Résidus standardisés",
+     ylim = c(0, max(density(resid_std_reduit)$y) * 1.1))
+
+# Courbe de densité observée
+lines(density(resid_std_reduit), 
+      col = "#1976D2", 
+      lwd = 2)
+
+# Courbe normale théorique
+x_seq <- seq(min(resid_std_reduit), max(resid_std_reduit), length.out = 100)
+lines(x_seq, 
+      dnorm(x_seq, mean = mean(resid_std_reduit), sd = sd(resid_std_reduit)),
+      col = "#D32F2F", 
+      lwd = 2, 
+      lty = 2)
+
+legend("topright", 
+       legend = c("Densité observée", "Normale théorique"),
+       col = c("#1976D2", "#D32F2F"),
+       lwd = 2,
+       lty = c(1, 2),
+       cex = 0.8)
+
+# 3. Résidus vs Fitted
+plot(fitted_reduit, resid_std_reduit,
+     main = "Résidus vs Valeurs ajustées (Réduit)",
+     xlab = "Valeurs ajustées", 
+     ylab = "Résidus standardisés",
+     pch = 19, col = "gray30")
+abline(h = 0, col = "#1976D2", lwd = 2)
+lines(lowess(fitted_reduit, resid_std_reduit), 
+      col = "#D32F2F", 
+      lwd = 2)
+
+par(mfrow = c(1, 1))
+```
+
+### Test d'homoscédasticité
+```{r}
+# Extraire les résidus du modèle
+resid_reduit <- model_arcsin_reduit$model$real_residuals
+
+# Test de Breusch-Pagan
+test_data_reduit <- data.frame(residuals = resid_reduit, fitted = fitted_reduit)
+lm_hetero_reduit <- lm(I(residuals^2) ~ fitted, data = test_data_reduit)
+bp_test_reduit <- bptest(lm_hetero_reduit)
+
+cat("\n=== TEST D'HOMOSCÉDASTICITÉ (MODÈLE RÉDUIT) ===\n")
+cat("Test de Breusch-Pagan :\n")
+cat("  Statistique BP =", round(bp_test_reduit$statistic, 4), "\n")
+cat("  p-value        =", round(bp_test_reduit$p.value, 4), "\n")
+cat("  Conclusion     :", 
+    ifelse(bp_test_reduit$p.value > 0.05, 
+           "  Homoscédasticité acceptée", 
+           "✗ Hétéroscédasticité détectée"), "\n")
+```
+```{r fig.width=8, fig.height=5}
+# Graphique diagnostique
+plot(fitted_reduit, resid_reduit^2,
+     main = "Test d'homoscédasticité - ARCSIN (Réduit)",
+     xlab = "Valeurs ajustées",
+     ylab = "Résidus au carré",
+      pch = 19, col = "#1976D2")
+abline(h = mean(resid_reduit^2), col = "#D32F2F", lwd = 2, lty = 2)
+lines(lowess(fitted_reduit, resid_reduit^2), col = "#1976D2", lwd = 2)
+```
+
+## Comparaison modèle complet vs réduit
+```{r}
+# Calculer AIC/BIC
+lm_arcsin_complet <- lm(formule_arcsin, data = data)
+lm_arcsin_reduit <- lm(formule_arcsin, data = data_reduit)
+
+comparison_table <- data.frame(
+  Modele = c("Complet (45 depts)", "Réduit (CV > 20%)"),
+  N_departements = c(nrow(data), nrow(data_reduit)),
+  AIC = c(AIC(lm_arcsin_complet), AIC(lm_arcsin_reduit)),
+  BIC = c(BIC(lm_arcsin_complet), BIC(lm_arcsin_reduit)),
+  Variance_EA = c(
+    model_arcsin$model$variance,
+    model_arcsin_reduit$model$variance
+  ),
+  Normalite_EA_p = c(
+    shapiro.test(model_arcsin$model$random_effects)$p.value,
+    sw_reduit$p.value
+  ),
+  Normalite_Resid_p = c(
+    shapiro.test(model_arcsin$model$std_real_residuals)$p.value,
+    sw_resid_reduit$p.value
+  ),
+  Homosced_p = c(
+    bptest(lm(I(model_arcsin$model$real_residuals^2) ~ model_arcsin$model$fitted))$p.value,
+    bp_test_reduit$p.value
+  )
+)
+
+cat("\n=== COMPARAISON MODÈLES ARCSIN ===\n")
+print(comparison_table, row.names = FALSE)
+
+# Décision
+if (comparison_table$Normalite_EA_p[2] > 0.05 && 
+    comparison_table$Normalite_Resid_p[2] > 0.05) {
+  cat("\n  MODÈLE RÉDUIT RETENU\n")
+  cat("  - Normalité des effets aléatoires acceptée (p =", 
+      round(sw_reduit$p.value, 4), ")\n")
+  cat("  - Normalité des résidus acceptée (p =", 
+      round(sw_resid_reduit$p.value, 4), ")\n")
+  cat("  - Variance EA :", round(model_arcsin_reduit$model$variance, 4), "\n")
+  model_final <- model_arcsin_reduit
+  data_finale <- data_reduit
+  modele_final_nom <- "ARCSIN RÉDUIT"
+} else {
+  cat("\n  MODÈLE COMPLET RETENU\n")
+  cat("  - Meilleur AIC/BIC (AIC =", round(comparison_table$AIC[1], 2), ")\n")
+  cat("  - Réduction CV supérieure (14.0%)\n")
+  cat("  - Ajustement optimal selon critères statistiques objectifs\n")
+  model_final <- model_arcsin
+  data_finale <- data
+  modele_final_nom <- "ARCSIN COMPLET"
+}
+```
+
+---
+
+# COMPARAISON DIRECT vs FAY-HERRIOT REDUIT 
+
+## Extraction des estimations
+```{r}
+# Extraire estimations du modèle final
+estimations <- estimators(model_arcsin_reduit, MSE = TRUE, CV = TRUE)
+
+cat("=== ESTIMATIONS DÉPARTEMENTALES (MODÈLE FINAL) ===\n")
+print(head(estimations$ind, 45))
+```
+
+
+## Statistiques des CV
+```{r}
+cat("\n=== COEFFICIENTS DE VARIATION ===\n\n")
+
+cat("ESTIMATIONS DIRECTES :\n")
+summary_direct_cv <- summary(estimations$ind$Direct_CV)
+print(summary_direct_cv)
+
+cat("\nESTIMATIONS FAY-HERRIOT :\n")
+summary_fh_cv <- summary(estimations$ind$FH_CV)
+print(summary_fh_cv)
+
+cat("\nRÉDUCTION MOYENNE DU CV :\n")
+reduction_cv <- mean((estimations$ind$Direct_CV - estimations$ind$FH_CV) / 
+                      estimations$ind$Direct_CV * 100, na.rm = TRUE)
+cat("Réduction moyenne :", round(reduction_cv, 2), "%\n")
+```
+
+## Graphiques comparatifs
+
+### Comparaison des CV
+```{r fig.width=14, fig.height=6}
+# 1. Préparation et jointure
+cv_comparison <- estimations$ind %>%
+  left_join(data_reduit %>% select(departement, n_echantillon), 
+            by = c("Domain" = "departement")) %>%
+  # On s'assure de trier par taille d'échantillon
+  arrange(n_echantillon) %>%
+  # On utilise 'Domain' pour créer le facteur ordonné
+  mutate(Domain = factor(Domain, levels = unique(Domain))) 
+
+# 2. Passage au format long pour ggplot
+cv_long <- cv_comparison %>%
+  select(Domain, Direct_CV, FH_CV) %>%
+  pivot_longer(
+    cols = c(Direct_CV, FH_CV),
+    names_to = "Type",
+    values_to = "CV"
+  ) %>%
+  mutate(
+    Type = factor(Type, 
+                  levels = c("Direct_CV", "FH_CV"),
+                  labels = c("Direct", "Fay-Herriot"))
+  )
+
+# 3. Visualisation
+ggplot(cv_long, aes(x = Domain, y = CV, color = Type, group = Type)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(
+    values = c("Direct" = "#D32F2F", "Fay-Herriot" = "#1976D2")
+  ) +
+  labs(
+    title = "Comparaison des coefficients de variation : Direct vs Fay-Herriot",
+    subtitle = "Efficacité du modèle sur les domaines à faible taille d'échantillon",
+    x = "Départements (ordonnés par taille d'échantillon croissante)",
+    y = "Coefficient de variation",
+    color = "Méthode d'estimation"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    # Rotation indispensable pour la lisibilité des départements
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10)
+  )
+```
+
+
+### Comparaison des MSE
+```{r fig.width=14, fig.height=6}
+mse_long <- cv_comparison %>%
+  select(departement, Domain, Direct_MSE, FH_MSE) %>%
+  pivot_longer(
+    cols = c(Direct_MSE, FH_MSE),
+    names_to = "Type",
+    values_to = "MSE"
+  ) %>%
+  mutate(
+    Type = factor(Type, 
+                  levels = c("Direct_MSE", "FH_MSE"),
+                  labels = c("Direct", "Fay-Herriot"))
+  )
+
+ggplot(mse_long, aes(x = index, y = MSE, color = Type, group = Type)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2) +
+  scale_color_manual(
+    values = c("Direct" = "#D32F2F", "Fay-Herriot" = "#1976D2")
+  ) +
+  labs(
+    title = "Comparaison des MSE : Direct vs Fay-Herriot",
+    subtitle = "Départements ordonnés par taille d'échantillon croissante",
+    x = "Départements (ordonnés par taille échantillon)",
+    y = "Erreur quadratique moyenne (MSE)",
+    color = "Type d'estimation"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "top")
+```
+
+### Scatter plot : Direct vs FH
+```{r fig.width=8, fig.height=8}
+ggplot(estimations$ind, aes(x = FH, y = Direct)) +
+  geom_point(color = "#1976D2", size = 3, alpha = 0.7) +
+  geom_abline(slope = 1, intercept = 0, 
+              color = "#D32F2F", linetype = "dashed", linewidth = 1.2) +
+  geom_smooth(method = "lm", se = TRUE, 
+              color = "#1976D2", fill = "#1976D2", alpha = 0.2) +
+  labs(
+    title = "Estimations Directes vs Fay-Herriot",
+    subtitle = "Points proches de la diagonale -> Cohérence entre méthodes",
+    x = "Estimation Fay-Herriot (Incidence pauvreté)",
+    y = "Estimation Directe (Incidence pauvreté)"
+  ) +
+  theme_minimal()
+
+cor_direct_fh <- cor(estimations$ind$Direct, estimations$ind$FH)
+cat("\nCorrélation Direct-FH :", round(cor_direct_fh, 4), "\n")
+```
+
+## Tableau de qualité des estimations
+```{r}
+quality_table <- estimations$ind %>%
+  mutate(
+    CV_Direct_Cat = case_when(
+      Direct_CV <= 0.10 ~ "Excellent (≤10%)",
+      Direct_CV <= 0.15 ~ "Bon (10-15%)",
+      Direct_CV <= 0.20 ~ "Acceptable (15-20%)",
+      TRUE ~ "Problématique (>20%)"
+    ),
+    CV_FH_Cat = case_when(
+      FH_CV <= 0.10 ~ "Excellent (≤10%)",
+      FH_CV <= 0.15 ~ "Bon (10-15%)",
+      FH_CV <= 0.20 ~ "Acceptable (15-20%)",
+      TRUE ~ "Problématique (>20%)"
+    )
+  )
+
+cat("\n=== RÉPARTITION DES CV PAR CATÉGORIE ===\n\n")
+cat("ESTIMATIONS DIRECTES :\n")
+print(table(quality_table$CV_Direct_Cat))
+
+cat("\nESTIMATIONS FAY-HERRIOT :\n")
+print(table(quality_table$CV_FH_Cat))
+```
+
+---
+
+# EXPORT DES RÉSULTATS
+```{r}
+if (!dir.exists("resultats_reduit")) {
+  dir.create("resultats_reduit")
+}
+
+# 1. Export estimations départementales
+write_xlsx(
+  estimations$ind %>% 
+    left_join(data_reduit %>% select(departement, n_echantillon), 
+              by = c("Domain" = "departement")),
+  "resultats_reduit/estimations_departementales_FH_ARCSIN.xlsx"
+)
+
+# 2. Export coefficients du modèle final
+write_xlsx(
+  as.data.frame(model_arcsin_reduit$model$coefficients),
+  "resultats_reduit/coefficients_modele_FH_ARCSIN.xlsx"
+)
+
+# 3. Export comparaison complet vs réduit
+write_xlsx(
+  comparison_table,
+  "resultats_reduit/comparaison_modele_complet_vs_reduit_ARCSIN.xlsx"
+)
+
+# 4. Export diagnostics
+diagnostics_final <- data.frame(
+  Test = c(
+    "Normalité effets aléatoires (Shapiro-Wilk)",
+    "Normalité résidus standardisés (Shapiro-Wilk)",
+    "Homoscédasticité (Breusch-Pagan)",
+    "Indépendance EA et RMSE (Pearson)"
+  ),
+  Statistique = c(
+    paste("W =", round(shapiro.test(model_arcsin_reduit$model$random_effects)$statistic, 4)),
+    paste("W =", round(shapiro.test(model_arcsin_reduit$model$std_real_residuals)$statistic, 4)),
+    paste("BP =", round(bptest(lm(I(model_arcsin_reduit$model$real_residuals^2) ~ 
+                                   model_arcsin_reduit$model$fitted))$statistic, 4)),
+    paste("r =", round(cor.test(model_arcsin_reduit$model$random_effects, 
+                                 sqrt(model_arcsin_reduit$MSE$FH))$estimate, 4))
+  ),
+  P_value = c(
+    round(shapiro.test(model_arcsin_reduit$model$random_effects)$p.value, 4),
+    round(shapiro.test(model_arcsin_reduit$model$std_real_residuals)$p.value, 4),
+    round(bptest(lm(I(model_arcsin_reduit$model$real_residuals^2) ~ 
+                      model_arcsin_reduit$model$fitted))$p.value, 4),
+    round(cor.test(model_arcsin_reduit$model$random_effects, 
+                   sqrt(model_arcsin_reduit$MSE$FH))$p.value, 4)
+  ),
+  Conclusion = c(
+    ifelse(shapiro.test(model_arcsin_reduit$model$random_effects)$p.value > 0.05, 
+           "  Acceptée", "✗ Rejetée"),
+    ifelse(shapiro.test(model_arcsin_reduit$model$std_real_residuals)$p.value > 0.05, 
+           "  Acceptée", "✗ Rejetée"),
+    ifelse(bptest(lm(I(model_arcsin_reduit$model$real_residuals^2) ~ 
+                       model_arcsin_reduit$model$fitted))$p.value > 0.05, 
+           "  Acceptée", "✗ Rejetée"),
+    ifelse(cor.test(model_arcsin_reduit$model$random_effects, 
+                    sqrt(model_arcsin_reduit$MSE$FH))$p.value > 0.05, 
+           "  Indépendance", "✗ Corrélation")
+  )
+)
+
+write_xlsx(
+  diagnostics_final,
+  "resultats_reduit/diagnostics_modele_FH_ARCSIN.xlsx"
+)
+
+cat("  Tous les résultats ont été exportés dans le dossier 'resultats_reduit/'\n")
+```
+
+
+# CONCLUSION - MODÈLE ARCSIN REDUIT 
+```{r}
+cat("=== SYNTHÈSE DE L'ANALYSE SAE MODÈLE ARCSIN REDUIT ===\n\n")
+
+cat("PERFORMANCE :\n")
+cat("- AIC =", round(AIC(lm(formule_arcsin, data = data_reduit)), 2), "\n")
+cat("- BIC =", round(BIC(lm(formule_arcsin, data = data_reduit)), 2), "\n")
+cat("- Variance EA (σ²_u) =", round(model_arcsin_reduit$model$variance, 4), "\n")
+cat("- Réduction moyenne CV :", round(reduction_cv, 2), "%\n\n")
+
+cat("DIAGNOSTICS :\n")
+cat("- Normalité effets aléatoires  :", 
+    ifelse(shapiro.test(model_arcsin_reduit$model$random_effects)$p.value > 0.05, 
+           "  Acceptée", "✗ Rejetée"),
+    " (p =", round(shapiro.test(model_arcsin_reduit$model$random_effects)$p.value, 4), ")\n")
+cat("- Normalité résidus standardisés:", 
+    ifelse(shapiro.test(model_arcsin_reduit$model$std_real_residuals)$p.value > 0.05, 
+           "  Acceptée", "✗ Rejetée"),
+    " (p =", round(shapiro.test(model_arcsin_reduit$model$std_real_residuals)$p.value, 4), ")\n")
+cat("- Homoscédasticité             :", 
+    ifelse(bptest(lm(I(model_arcsin_reduit$model$real_residuals^2) ~ 
+                       model_arcsin_reduit$model$fitted))$p.value > 0.05, 
+           "  Acceptée", "✗ Rejetée"),
+    " (p =", round(bptest(lm(I(model_arcsin_reduit$model$real_residuals^2) ~ 
+                              model_arcsin_reduit$model$fitted))$p.value, 4), ")\n")
+cat("- Indépendance EA et RMSE      :", 
+    ifelse(cor.test(model_arcsin_reduit$model$random_effects, 
+                    sqrt(model_arcsin_reduit$MSE$FH))$p.value > 0.05, 
+           "  Acceptée", "✗ Rejetée"),
+    " (p =", round(cor.test(model_arcsin_reduit$model$random_effects, 
+                            sqrt(model_arcsin_reduit$MSE$FH))$p.value, 4), ")\n\n")
+
+cat("LIMITES DOCUMENTÉES :\n")
+if (shapiro.test(model_arcsin_reduit$model$random_effects)$p.value <= 0.05) {
+  cat("⚠ Violation de la normalité des effets aléatoires\n")
+  cat("  -> Intervalles de confiance à interpréter avec prudence\n")
+}
+```
+
+
+
+# COMPARAISON DIRECT vs FAY-HERRIOT COMPLET 
+
+## Extraction des estimations
+```{r}
+# Extraire estimations du modèle ARCSIN COMPLET
+estimations <- estimators(model_arcsin, MSE = TRUE, CV = TRUE)
+
+cat("=== ESTIMATIONS DÉPARTEMENTALES (MODÈLE FINAL) ===\n")
+print(head(estimations$ind, 45))
+```
+
+## Statistiques des CV
+```{r}
+cat("\n=== COEFFICIENTS DE VARIATION ===\n\n")
+
+cat("ESTIMATIONS DIRECTES :\n")
+summary_direct_cv <- summary(estimations$ind$Direct_CV)
+print(summary_direct_cv)
+
+cat("\nESTIMATIONS FAY-HERRIOT :\n")
+summary_fh_cv <- summary(estimations$ind$FH_CV)
+print(summary_fh_cv)
+
+cat("\nRÉDUCTION MOYENNE DU CV :\n")
+reduction_cv <- mean((estimations$ind$Direct_CV - estimations$ind$FH_CV) / 
+                      estimations$ind$Direct_CV * 100, na.rm = TRUE)
+cat("Réduction moyenne :", round(reduction_cv, 2), "%\n")
+```
+
+## Graphiques comparatifs
+
+```{r}
+### 1. Préparation de la base de comparaison
+cv_comparison <- estimations$ind %>%
+  left_join(data %>% select(departement, n_echantillon), 
+            by = c("Domain" = "departement")) %>%
+  arrange(n_echantillon) %>%
+  # On fige l'ordre des domaines selon la taille de l'échantillon
+  mutate(Domain = factor(Domain, levels = unique(Domain)))
+
+```
+
+
+### 2. Comparaison des CV
+```{r fig.width=14, fig.height=6}
+
+cv_long <- cv_comparison %>%
+  select(Domain, Direct_CV, FH_CV) %>%
+  pivot_longer(
+    cols = c(Direct_CV, FH_CV),
+    names_to = "Type",
+    values_to = "CV"
+  ) %>%
+  mutate(
+    Type = factor(Type, 
+                  levels = c("Direct_CV", "FH_CV"),
+                  labels = c("Direct", "Fay-Herriot"))
+  )
+
+ggplot(cv_long, aes(x = Domain, y = CV, color = Type, group = Type)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("Direct" = "#D32F2F", "Fay-Herriot" = "#1976D2")) +
+  labs(
+    title = "Comparaison des coefficients de variation : Direct vs Fay-Herriot",
+    subtitle = "Stabilité des estimations par rapport à la taille d'échantillon",
+    x = "Départements (ordonnés par taille d'échantillon)",
+    y = "Coefficient de variation",
+    color = "Méthode"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8)
+  )
+```
+
+
+### Comparaison des MSE
+
+```{r fig.width=14, fig.height=6}
+mse_long <- cv_comparison %>%
+  select(Domain, Direct_MSE, FH_MSE) %>%
+  pivot_longer(
+    cols = c(Direct_MSE, FH_MSE),
+    names_to = "Type",
+    values_to = "MSE"
+  ) %>%
+  mutate(
+    Type = factor(Type, 
+                  levels = c("Direct_MSE", "FH_MSE"),
+                  labels = c("Direct", "Fay-Herriot"))
+  )
+
+ggplot(mse_long, aes(x = Domain, y = MSE, color = Type, group = Type)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("Direct" = "#D32F2F", "Fay-Herriot" = "#1976D2")) +
+  labs(
+    title = "Comparaison des erreurs quadratiques moyennes (MSE) : Direct vs Fay-Herriot",
+    subtitle = "Réduction de l'incertitude grâce aux variables auxiliaires",
+    x = "Départements (ordonnés par taille d'échantillon)",
+    y = "MSE",
+    color = "Méthode"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8)
+  )
+```
+
+
+### Scatter plot : Direct vs FH
+```{r fig.width=8, fig.height=8}
+ggplot(estimations$ind, aes(x = FH, y = Direct)) +
+  geom_point(color = "#1976D2", size = 3, alpha = 0.7) +
+  geom_abline(slope = 1, intercept = 0, 
+              color = "#D32F2F", linetype = "dashed", linewidth = 1.2) +
+  geom_smooth(method = "lm", se = TRUE, 
+              color = "#1976D2", fill = "#1976D2", alpha = 0.2) +
+  labs(
+    title = "Estimations Directes vs Fay-Herriot ",
+    subtitle = "Points proches de la diagonale -> Cohérence entre méthodes",
+    x = "Estimation Fay-Herriot (Incidence pauvreté)",
+    y = "Estimation Directe (Incidence pauvreté)"
+  ) +
+  theme_minimal()
+
+cor_direct_fh <- cor(estimations$ind$Direct, estimations$ind$FH)
+cat("\nCorrélation Direct-FH :", round(cor_direct_fh, 4), "\n")
+```
+
+## Tableau de qualité des estimations
+```{r}
+quality_table <- estimations$ind %>%
+  mutate(
+    CV_Direct_Cat = case_when(
+      Direct_CV <= 0.10 ~ "Excellent (≤10%)",
+      Direct_CV <= 0.15 ~ "Bon (10-15%)",
+      Direct_CV <= 0.20 ~ "Acceptable (15-20%)",
+      TRUE ~ "Problématique (>20%)"
+    ),
+    CV_FH_Cat = case_when(
+      FH_CV <= 0.10 ~ "Excellent (≤10%)",
+      FH_CV <= 0.15 ~ "Bon (10-15%)",
+      FH_CV <= 0.20 ~ "Acceptable (15-20%)",
+      TRUE ~ "Problématique (>20%)"
+    )
+  )
+
+cat("\n=== RÉPARTITION DES CV PAR CATÉGORIE ===\n\n")
+cat("ESTIMATIONS DIRECTES :\n")
+print(table(quality_table$CV_Direct_Cat))
+
+cat("\nESTIMATIONS FAY-HERRIOT :\n")
+print(table(quality_table$CV_FH_Cat))
+```
+
+---
+
+# EXPORT DES RÉSULTATS
+```{r}
+if (!dir.exists("resultats_complet")) {
+  dir.create("resultats_complet")
+}
+
+# 1. Export estimations départementales
+write_xlsx(
+  estimations$ind %>% 
+    left_join(data %>% select(departement, n_echantillon), 
+              by = c("Domain" = "departement")),
+  "resultats_complet/estimations_departementales_FH_ARCSIN.xlsx"
+)
+
+# 2. Export coefficients du modèle ARCSIN COMPLET
+write_xlsx(
+  as.data.frame(model_arcsin$model$coefficients),
+  "resultats_complet/coefficients_modele_FH_ARCSIN.xlsx"
+)
+
+# 3. Export comparaison complet vs réduit
+write_xlsx(
+  comparison_table,
+  "resultats_complet/comparaison_modele_complet_vs_reduit_ARCSIN.xlsx"
+)
+
+# 4. Export diagnostics
+diagnostics_final <- data.frame(
+  Test = c(
+    "Normalité effets aléatoires (Shapiro-Wilk)",
+    "Normalité résidus standardisés (Shapiro-Wilk)",
+    "Homoscédasticité (Breusch-Pagan)",
+    "Indépendance EA et RMSE (Pearson)"
+  ),
+  Statistique = c(
+    paste("W =", round(shapiro.test(model_arcsin$model$random_effects)$statistic, 4)),
+    paste("W =", round(shapiro.test(model_arcsin$model$std_real_residuals)$statistic, 4)),
+    paste("BP =", round(bptest(lm(I(model_arcsin$model$real_residuals^2) ~ 
+                                   model_arcsin$model$fitted))$statistic, 4)),
+    paste("r =", round(cor.test(model_arcsin$model$random_effects, 
+                                 sqrt(model_arcsin$MSE$FH))$estimate, 4))
+  ),
+  P_value = c(
+    round(shapiro.test(model_arcsin$model$random_effects)$p.value, 4),
+    round(shapiro.test(model_arcsin$model$std_real_residuals)$p.value, 4),
+    round(bptest(lm(I(model_arcsin$model$real_residuals^2) ~ 
+                      model_arcsin$model$fitted))$p.value, 4),
+    round(cor.test(model_arcsin$model$random_effects, 
+                   sqrt(model_arcsin$MSE$FH))$p.value, 4)
+  ),
+  Conclusion = c(
+    ifelse(shapiro.test(model_arcsin$model$random_effects)$p.value > 0.05, 
+           "  Acceptée", "✗ Rejetée"),
+    ifelse(shapiro.test(model_arcsin$model$std_real_residuals)$p.value > 0.05, 
+           "  Acceptée", "✗ Rejetée"),
+    ifelse(bptest(lm(I(model_arcsin$model$real_residuals^2) ~ 
+                       model_arcsin$model$fitted))$p.value > 0.05, 
+           "  Acceptée", "✗ Rejetée"),
+    ifelse(cor.test(model_arcsin$model$random_effects, 
+                    sqrt(model_arcsin$MSE$FH))$p.value > 0.05, 
+           "  Indépendance", "✗ Corrélation")
+  )
+)
+
+write_xlsx(
+  diagnostics_final,
+  "resultats_complet/diagnostics_modele_FH_ARCSIN.xlsx"
+)
+
+cat("  Tous les résultats ont été exportés dans le dossier 'resultats_complet/'\n")
+```
+
+
+
+
+---
+
+# CONCLUSION - MODÈLE ARCSIN COMPLET
+```{r}
+cat("=== SYNTHÈSE DE L'ANALYSE SAE (ARCSIN COMPLET) ===\n\n")
+
+cat("PERFORMANCE :\n")
+cat("- AIC =", round(AIC(lm(formule_arcsin, data = data)), 2), "\n")
+cat("- BIC =", round(BIC(lm(formule_arcsin, data = data)), 2), "\n")
+cat("- Variance EA (σ²_u) =", round(model_arcsin$model$variance, 4), "\n")
+cat("- Réduction moyenne CV :", round(reduction_cv, 2), "%\n\n")
+
+cat("DIAGNOSTICS :\n")
+cat("- Normalité effets aléatoires  :", 
+    ifelse(shapiro.test(model_arcsin$model$random_effects)$p.value > 0.05, 
+           "  Acceptée", "✗ Rejetée"),
+    " (p =", round(shapiro.test(model_arcsin$model$random_effects)$p.value, 4), ")\n")
+cat("- Normalité résidus standardisés:", 
+    ifelse(shapiro.test(model_arcsin$model$std_real_residuals)$p.value > 0.05, 
+           "  Acceptée", "✗ Rejetée"),
+    " (p =", round(shapiro.test(model_arcsin$model$std_real_residuals)$p.value, 4), ")\n")
+cat("- Homoscédasticité             :", 
+    ifelse(bptest(lm(I(model_arcsin$model$real_residuals^2) ~ 
+                       model_arcsin$model$fitted))$p.value > 0.05, 
+           "  Acceptée", "✗ Rejetée"),
+    " (p =", round(bptest(lm(I(model_arcsin$model$real_residuals^2) ~ 
+                              model_arcsin$model$fitted))$p.value, 4), ")\n")
+cat("- Indépendance EA et RMSE      :", 
+    ifelse(cor.test(model_arcsin$model$random_effects, 
+                    sqrt(model_arcsin$MSE$FH))$p.value > 0.05, 
+           "  Acceptée", "✗ Rejetée"),
+    " (p =", round(cor.test(model_arcsin$model$random_effects, 
+                            sqrt(model_arcsin$MSE$FH))$p.value, 4), ")\n\n")
+
+cat("JUSTIFICATION DU CHOIX ARCSIN :\n")
+cat("1. Ajustement nettement supérieur (AIC/BIC largement meilleurs)\n")
+cat("2. Réduction du CV supérieure (14.0% vs 11.5% pour logit)\n")
+cat("3. Transformation reconnue pour proportions (Freeman & Tukey, 1950)\n")
+cat("4. Critères objectifs AIC/BIC privilégiés\n\n")
+
+cat("LIMITES DOCUMENTÉES :\n")
+if (shapiro.test(model_arcsin$model$random_effects)$p.value <= 0.05) {
+  cat("⚠ Violation de la normalité des effets aléatoires\n")
+  cat("  -> Intervalles de confiance à interpréter avec prudence\n")
+}
+cat("-> Gains de précision modestes (~14%)\n")
+cat("-> Nécessité d'explorer approches alternatives (spatial, bayésien)\n\n")
+
+cat("  L'approche SAE avec transformation arcsin a permis d'améliorer\n")
+cat("  la précision des estimations départementales de pauvreté\n")
+cat("  multidimensionnelle au Sénégal, avec un ajustement optimal.\n")
+```
+
+
+**FIN DU DOCUMENT**
+
